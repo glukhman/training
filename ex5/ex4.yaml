@@ -1,0 +1,120 @@
+# Blueprint ex. 4:
+# Write a blueprint that starts two ‘Hello World’ on OpenStack in a single blueprint
+# Is there another way to write this blueprint?
+
+# Blueprint ex. 5:
+# Can you think of any other way? (hint: REST plugin)
+# Write a blueprint that creates two VM-s that are connected to the same network (Notice: you need to create also the network).
+# Install on one VM an HTTP server application and on the other an HTTP client, which sends an HTTP request every min.
+# Set a scaling policy that scales up and scales down that will sustain this behavior.
+
+
+tosca_definitions_version: cloudify_dsl_1_3
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/5.0.dev1/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.14.7/plugin.yaml    # add if working with Openstack Rackspace
+
+inputs:   # parameters, which the bluepript receives from user during deployment
+  http_port:
+    description: The HTTP web server port
+    default: 8080
+  agent_user:
+    description: User name used when SSH-ing into the VM
+    default: centos
+  image:
+    description: Openstack image name or id to install on the VM
+    default: CentOS-7-x86_64-GenericCloud
+  flavor:
+    description: Openstack flavor name or id (defince processing power, RAM etc.) for the VM
+    default: m1.medium    # 2 VCPUs, 40G disk space, 4G RAM 
+  network_name:
+    description: Openstack network name the new server will be connected to
+  floating_network_id:
+    description: The id of the network to use for allocating a floating ip
+  key_pair_name:
+    description: Openstack key pair name to associate with the VM
+  private_key_path:
+    description: |
+      Path to the private key which will be used for connecting to the server
+      on the manager or machine running CLI if running in local mode.
+
+dsl_definitions:
+
+  host_relationships: &host_relationships
+  - type: cloudify.openstack.server_connected_to_keypair
+    target: keypair  
+  - type: cloudify.openstack.server_connected_to_floating_ip
+    target: virtual_ip
+  - type: cloudify.openstack.server_connected_to_security_group
+    target: security_group  
+  host_lifecycle_interfaces: &host_lifecycle_interfaces
+    create:
+      inputs:
+        args:
+          # associate the created VM node(s) with a security group
+          security_groups: [{ get_attribute: [ security_group, external_name ]}]
+
+node_templates:
+
+
+  security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      rules:
+        - port: { get_input: http_port }
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  keypair:
+    type: cloudify.openstack.nodes.KeyPair
+    properties:
+      use_external_resource: true
+      resource_id: { get_input: key_pair_name }
+      private_key_path: { get_input: private_key_path }
+
+  virtual_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      floatingip:
+        floating_network_id: { get_input: floating_network_id }
+
+  server_host: 
+    type: cloudify.openstack.nodes.Server 
+    properties:
+      image:  { get_input: image }
+      flavor: { get_input: flavor }                    
+      agent_config:   # data for SSH-ing into the agent
+        user: { get_input: agent_user }
+        key: { get_property: [ keypair, private_key_path ] } 
+      management_network_name: { get_input: network_name }      
+    relationships: *host_relationships
+    interfaces:
+      cloudify.interfaces.relationship_lifecycle: *host_lifecycle_interfaces 
+
+  # the webserver
+  webserver:
+    type: cloudify.nodes.WebServer   # derived from cloudify.nodes.SoftwareComponent
+    properties:
+      port: { get_input: http_port }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: server_host
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: scripts/config.sh
+        start: scripts/start.sh
+        stop: scripts/stop.sh
+
+groups:
+  host_group:
+    members: [server_host, virtual_ip]
+
+# group policy for scaling avoids cross-dependencies between multiple instances
+policies:
+  scale_policy1:
+    type: cloudify.policies.scaling
+    properties:
+      default_instances: 2
+    targets: [host_group]

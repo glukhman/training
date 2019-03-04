@@ -1,0 +1,217 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  This Blueprint installs the nodecellar application
+  on an openstack cloud environment.
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5.5/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.14.7/plugin.yaml
+  - http://www.getcloudify.org/spec/utilities-plugin/1.11.2/plugin.yaml
+
+inputs:
+
+  http_port:
+    default: 8080
+  app_port:
+    default: 3300
+  image:
+    description: Image to be used when launching agent VM's
+    default: CentOS-7-x86_64-GenericCloud
+  flavor:
+    description: Flavor of the agent VM's
+    default: m1.medium    # 2 VCPUs, 40G disk space, 4G RAM 
+  agent_user:
+    description: User for connecting to agent VM's
+    default: centos
+  network_name:
+    description: Openstack network name the new server will be connected to
+  external_network_name:
+    description: The name of the network to use for allocating a floating ip
+  key_pair_name:
+    description: Openstack key pair name of the key to associate with the new server
+  private_key_path:
+    description: |
+      Path to the private key which will be used for connecting to the server
+      on the manager or machine running CLI if running in local mode.   
+
+node_types:
+  FlaskServer:
+    derived_from: cloudify.nodes.ApplicationServer
+    properties:
+      port: 
+        default: { get_input: app_port }
+
+node_templates:
+
+  web_host:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      image: { get_input: image }
+      flavor: { get_input: flavor }
+      cloudify_agent:
+        user: { get_input: agent_user }
+      agent_config:
+        key: { get_property: [ keypair, private_key_path ] }
+      management_network_name: { get_input: network_name }      
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            args:
+              security_groups: [{ get_attribute: [ web_secgroup, external_name ]}]
+    relationships:
+      - type: cloudify.openstack.server_connected_to_keypair
+        target: keypair
+      - target: web_ip
+        type: cloudify.openstack.server_connected_to_floating_ip
+      - target: web_secgroup
+        type: cloudify.openstack.server_connected_to_security_group      
+
+  webserver:
+    type: cloudify.nodes.WebServer
+    properties:
+      port: { get_input: http_port }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: web_host
+      - type: webserver_depends_on_appserver
+        target: app_host
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: scripts/install-web.sh
+        start: 
+          implementation: scripts/start-web.sh
+          inputs: 
+            app_port: { get_input: app_port }
+        stop: scripts/stop-web.sh
+
+  rest_user:
+    type: cloudify.rest.Requests
+    properties:
+      hosts: [ { get_capability: [ex5, app_endpoint, ip] } ]    # << this creates the ambiguity
+      port: { get_input: app_port }
+      ssl: false
+      verify: false
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: web_host    
+      # - target: app_host
+      #   type: restuser_depends_on_apphost_ip  
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        start:
+          inputs:
+            template_file: rest_template.yaml
+            
+  appserver:
+    type: FlaskServer
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: app_host
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure: scripts/install-flask.sh
+        start: scripts/start-flask.sh
+        stop: scripts/stop-flask.sh
+
+  app_host:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      image: { get_input: image }
+      flavor: { get_input: flavor }
+      cloudify_agent:
+        user: { get_input: agent_user }
+      agent_config:
+        key: { get_property: [ keypair, private_key_path ] }
+      management_network_name: { get_input: network_name }      
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          inputs:
+            args:
+              security_groups: [{ get_attribute: [ app_secgroup, external_name ]}]
+    relationships:
+      - type: cloudify.openstack.server_connected_to_keypair
+        target: keypair
+      - target: app_ip
+        type: cloudify.openstack.server_connected_to_floating_ip
+      - target: app_secgroup
+        type: cloudify.openstack.server_connected_to_security_group
+
+  web_secgroup:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      security_group:
+        name: web_secgroup
+      rules:        
+        - port: { get_input: http_port }
+          remote_ip_prefix: 0.0.0.0/0          
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  app_secgroup:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      security_group:
+        name: app_secgroup
+      rules:        
+        - port: { get_input: app_port }
+          remote_ip_prefix: 0.0.0.0/0          
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+
+  web_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      floatingip:
+        floating_network_name: { get_input: external_network_name }
+
+  app_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      floatingip:
+        floating_network_name: { get_input: external_network_name }
+
+  keypair:
+    type: cloudify.openstack.nodes.KeyPair
+    properties:
+      use_external_resource: true
+      resource_id: { get_input: key_pair_name }
+      private_key_path: { get_input: private_key_path }
+
+relationships:    # here we may add custom relationships
+  webserver_depends_on_appserver:
+    derived_from: cloudify.relationships.depends_on
+    target_interfaces:
+      cloudify.interfaces.relationship_lifecycle:
+        postconfigure:
+          implementation: scripts/get_app_ip.sh
+  # restuser_depends_on_apphost_ip:
+  #   derived_from: cloudify.relationships.depends_on
+  #   target_interfaces:
+  #     cloudify.interfaces.relationship_lifecycle:
+  #       preconfigure:
+  #         implementation: scripts/get_app_ip.sh
+
+    
+
+groups:
+  host_group:
+    members: [app_host, app_ip, web_host, web_ip]
+
+# group policy for scaling avoids cross-dependencies between multiple instances
+policies:
+  scale_policy0:
+    type: cloudify.policies.scaling
+    properties:
+      default_instances: 2
+    targets: [host_group]
+
+
+capabilities:
+  app_endpoint:
+      description: ip and port of the web application
+      value:
+        ip: { get_attribute: [app_host, ip] }
+        port: { get_attribute: [appserver, port] }

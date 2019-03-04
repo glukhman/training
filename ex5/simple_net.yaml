@@ -1,0 +1,223 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  Create an Example Openstack Network.
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5.5/types.yaml
+  - http://www.getcloudify.org/spec/openstack-plugin/2.14.7/plugin.yaml
+
+inputs:
+
+  username:
+    description: OS_USERNAME as specified in Openstack RC file.
+    default: { get_secret: keystone_username }
+
+  password:
+    description: Openstack user password.
+    default: { get_secret: keystone_password }
+
+  tenant_name:
+    description: OS_TENANT_NAME as specified in Openstack RC file.
+    default: { get_secret: keystone_tenant_name }
+
+  auth_url:
+    description: OS_AUTH_URL as specified in Openstack RC file.
+    default: { get_secret: keystone_url }
+
+  region:
+    description: OS_REGION_NAME as specified in Openstack RC file.
+    default: { get_secret: keystone_region }
+
+  external_network_name:
+    description: Openstack tenant external network name.
+
+  agent_user:
+    description: User name used when SSH-ing into the VM
+    default: centos
+  image:
+    description: Openstack image name or id to install on the VM
+    default: CentOS-7-x86_64-GenericCloud
+  flavor:
+    description: Openstack flavor name or id (defince processing power, RAM etc.) for the VM
+    default: m1.medium    # 2 VCPUs, 40G disk space, 4G RAM 
+  key_pair_name:
+  private_key_path:
+
+  nameservers:
+    default: [8.8.4.4, 8.8.8.8]
+
+  public_subnet_cidr:
+    default: 10.10.0.0/24
+
+  public_subnet_allocation_pools:
+    default:
+    - start: 10.10.0.2
+      end: 10.10.0.254
+
+dsl_definitions:
+
+  client_config: &client_config
+    username: { get_input: username }
+    password: { get_input: password }
+    tenant_name: { get_input: tenant_name }
+    auth_url: { get_input: auth_url }
+    region: { get_input: region }
+
+node_templates:
+
+  external_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *client_config
+      use_external_resource: true
+      resource_id: { get_input: external_network_name }
+
+  network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *client_config
+
+  router:
+    type: cloudify.openstack.nodes.Router
+    properties:
+      openstack_config: *client_config
+    relationships:
+    - type: cloudify.relationships.connected_to
+      target: external_network
+
+  subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *client_config
+      subnet:
+        ip_version: 4
+        cidr: { get_input: public_subnet_cidr }
+        dns_nameservers: { get_input: nameservers }
+        allocation_pools: { get_input: public_subnet_allocation_pools }
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: network
+    - type: cloudify.openstack.subnet_connected_to_router
+      target: router
+
+  application_server_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      floatingip:
+        floating_network_name: { get_input: external_network_name }
+      openstack_config: *client_config
+
+  web_server_ip:
+    type: cloudify.openstack.nodes.FloatingIP
+    properties:
+      floatingip:
+        floating_network_name: { get_input: external_network_name }
+      openstack_config: *client_config
+
+  application_host:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *client_config
+      resource_id: ex5_app_host
+      agent_config:
+        key: { get_property: [ keypair, private_key_path ] }
+      image: { get_input: image }
+      flavor: { get_input: flavor }
+      cloudify_agent:
+        user: { get_input: agent_user }        
+      management_network_name: { get_property: [network, resource_id] }
+    relationships:
+      - target: keypair
+        type: cloudify.openstack.server_connected_to_keypair
+      - target: application_server_ip
+        type: cloudify.openstack.server_connected_to_floating_ip
+      - target: application_port
+        type: cloudify.openstack.server_connected_to_port
+      - target: application_security_group
+        type: cloudify.openstack.server_connected_to_security_group
+
+  # web_host:
+  #   type: cloudify.openstack.nodes.Server
+  #   properties:
+  #     openstack_config: *client_config
+  #     resource_id: ex5_web_host
+  #     install_agent: false
+  #     server:
+  #       image: { get_input: image }
+  #       flavor: { get_input: flavor }
+  #     management_network_name: { get_property: [network, resource_id] }
+  #   relationships:
+  #     - target: keypair
+  #       type: cloudify.openstack.server_connected_to_keypair
+  #     - target: web_server_ip
+  #       type: cloudify.openstack.server_connected_to_floating_ip
+  #     - target: web_port
+  #       type: cloudify.openstack.server_connected_to_port
+
+  keypair:
+    type: cloudify.openstack.nodes.KeyPair
+    properties:
+      resource_id: { get_input: key_pair_name }
+      private_key_path: { get_input: private_key_path }
+      openstack_config: *client_config
+
+  application_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *client_config
+      resource_id: app_port
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: network
+      - type: cloudify.relationships.depends_on
+        target: subnet
+      - type: cloudify.openstack.port_connected_to_security_group
+        target: application_security_group
+
+  application_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *client_config
+      resource_id: app_security_group
+      security_group:
+        description: app host security group
+      rules:
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 5000
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 8080
+          remote_ip_prefix: 0.0.0.0/0        
+
+  web_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *client_config
+      resource_id: web_port
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: network
+      - type: cloudify.relationships.depends_on
+        target: subnet
+      - type: cloudify.openstack.port_connected_to_security_group
+        target: web_security_group
+
+  web_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *client_config
+      resource_id: web_security_group
+      security_group:
+        description: web host security group
+      rules:
+        - port: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - port: 8080
+          remote_ip_prefix: 0.0.0.0/0
+
+  
+
